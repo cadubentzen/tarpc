@@ -143,6 +143,7 @@ impl Parse for RpcMethod {
 #[derive(Default)]
 struct DeriveMeta {
     derive: Option<Derive>,
+    derive_contains_fds: bool,
     warnings: Vec<TokenStream2>,
 }
 
@@ -168,7 +169,9 @@ impl Parse for DeriveMeta {
 
         let mut derives = Vec::new();
         let mut derive_serde = Vec::new();
+        let mut derive_contains_fds = Vec::new();
         let mut has_derive_serde = false;
+        let mut has_derive_contains_fds = false;
         let mut has_explicit_derives = false;
 
         let meta_items = input.parse_terminated(MetaNameValue::parse, Comma)?;
@@ -255,6 +258,34 @@ impl Parse for DeriveMeta {
                     ),
                 }
                 derive_serde.push(meta);
+            } else if segment.ident == "derive_contains_fds" {
+                has_derive_contains_fds = true;
+                let Expr::Lit(expr_lit) = &meta.value else {
+                    extend_errors!(
+                        result,
+                        syn::Error::new(meta.value.span(), "expected literal")
+                    );
+                    continue;
+                };
+                match expr_lit.lit {
+                    Lit::Bool(LitBool { value: true, .. }) => {
+                        result = result.map(|mut d| {
+                            d.derive_contains_fds = true;
+                            d
+                        })
+                    }
+                    Lit::Bool(LitBool { value: false, .. }) => {
+                        // Default is false, so nothing to do
+                    }
+                    _ => extend_errors!(
+                        result,
+                        syn::Error::new(
+                            expr_lit.lit.span(),
+                            "`derive_contains_fds` expects a value of type `bool`"
+                        )
+                    ),
+                }
+                derive_contains_fds.push(meta);
             } else {
                 extend_errors!(
                     result,
@@ -320,6 +351,34 @@ impl Parse for DeriveMeta {
                     )
                 );
             }
+        }
+
+        if derive_contains_fds.len() > 1 {
+            for (i, item) in derive_contains_fds.iter().enumerate() {
+                extend_errors!(
+                    result,
+                    syn::Error::new(
+                        item.span(),
+                        format!(
+                            "`derive_contains_fds` appears more than once (occurrence #{})",
+                            i + 1
+                        )
+                    )
+                );
+            }
+        }
+
+        // derive_contains_fds can be combined with derive_serde but not with explicit derives
+        // (since explicit derives would need to include ContainsFds manually)
+        if has_explicit_derives && has_derive_contains_fds {
+            extend_errors!(
+                result,
+                syn::Error::new(
+                    input.span(),
+                    "tarpc does not support `derive_contains_fds` and `derive` at the same time. \
+                     Use `derive = [..., ::tarpc::ContainsFds]` instead."
+                )
+            );
         }
 
         result
@@ -501,6 +560,7 @@ pub fn service(attr: TokenStream, input: TokenStream) -> TokenStream {
             .map(|(rpc, name)| Ident::new(name, rpc.ident.span()))
             .collect::<Vec<_>>(),
         derives: derives.as_ref(),
+        derive_contains_fds: derive_meta.derive_contains_fds,
         warnings: &derive_meta.warnings,
     }
     .into_token_stream()
@@ -528,6 +588,7 @@ struct ServiceGenerator<'a> {
     return_types: &'a [&'a Type],
     arg_pats: &'a [Vec<&'a Pat>],
     derives: Option<&'a TokenStream2>,
+    derive_contains_fds: bool,
     warnings: &'a [TokenStream2],
 }
 
@@ -644,6 +705,7 @@ impl ServiceGenerator<'_> {
     fn enum_request(&self) -> TokenStream2 {
         let &Self {
             derives,
+            derive_contains_fds,
             vis,
             request_ident,
             camel_case_idents,
@@ -653,11 +715,18 @@ impl ServiceGenerator<'_> {
             ..
         } = self;
 
+        let contains_fds_derive = if derive_contains_fds {
+            Some(quote! { #[derive(::tarpc::ContainsFds)] })
+        } else {
+            None
+        };
+
         quote! {
             /// The request sent over the wire from the client to the server.
             #[allow(missing_docs)]
             #[derive(Debug)]
             #derives
+            #contains_fds_derive
             #vis enum #request_ident {
                 #(
                     #( #method_cfgs )*
@@ -682,6 +751,7 @@ impl ServiceGenerator<'_> {
     fn enum_response(&self) -> TokenStream2 {
         let &Self {
             derives,
+            derive_contains_fds,
             vis,
             response_ident,
             camel_case_idents,
@@ -689,11 +759,18 @@ impl ServiceGenerator<'_> {
             ..
         } = self;
 
+        let contains_fds_derive = if derive_contains_fds {
+            Some(quote! { #[derive(::tarpc::ContainsFds)] })
+        } else {
+            None
+        };
+
         quote! {
             /// The response sent over the wire from the server to the client.
             #[allow(missing_docs)]
             #[derive(Debug)]
             #derives
+            #contains_fds_derive
             #vis enum #response_ident {
                 #( #camel_case_idents(#return_types) ),*
             }

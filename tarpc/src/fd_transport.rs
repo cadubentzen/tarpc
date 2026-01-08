@@ -62,6 +62,14 @@ impl FdUnixStream {
         })
     }
 
+    /// Returns a reference to the inner AsyncFd for poll-based operations.
+    ///
+    /// This is used internally by `FdChannelTransport` to implement
+    /// `Stream` and `Sink`.
+    pub fn inner(&self) -> &AsyncFd<StdUnixStream> {
+        &self.inner
+    }
+
     /// Connects to a Unix socket at the given path.
     pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         // Use tokio's UnixStream for connection, then convert
@@ -167,7 +175,9 @@ impl AsRawFd for FdUnixStream {
 }
 
 /// Synchronously send data with file descriptors using sendmsg.
-fn send_with_fds_sync(
+///
+/// This is a low-level function used internally by the transport.
+pub fn send_with_fds_sync(
     socket: &StdUnixStream,
     data: &[u8],
     fds: &[BorrowedFd<'_>],
@@ -226,7 +236,9 @@ fn send_with_fds_sync(
 }
 
 /// Synchronously receive data with file descriptors using recvmsg.
-fn recv_with_fds_sync(socket: &StdUnixStream, buf: &mut [u8]) -> io::Result<FdMessage> {
+///
+/// This is a low-level function used internally by the transport.
+pub fn recv_with_fds_sync(socket: &StdUnixStream, buf: &mut [u8]) -> io::Result<FdMessage> {
     use libc::{
         c_void, cmsghdr, iovec, msghdr, recvmsg, CMSG_DATA, CMSG_FIRSTHDR, CMSG_NXTHDR,
         CMSG_SPACE, SCM_RIGHTS, SOL_SOCKET,

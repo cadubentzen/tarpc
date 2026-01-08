@@ -562,6 +562,79 @@ pub enum FdError {
     Io(#[from] std::io::Error),
 }
 
+// Implement ContainsFds for tarpc wrapper types
+// These implementations delegate to the inner message type.
+
+impl<T: ContainsFds> ContainsFds for crate::ClientMessage<T> {
+    fn extract_fds_with_index(&self, next_index: &mut u32) -> Vec<OwnedFd> {
+        match self {
+            crate::ClientMessage::Request(req) => req.extract_fds_with_index(next_index),
+            crate::ClientMessage::Cancel { .. } => Vec::new(),
+        }
+    }
+
+    fn inject_fds_from(&self, fds: &mut [Option<OwnedFd>]) {
+        match self {
+            crate::ClientMessage::Request(req) => req.inject_fds_from(fds),
+            crate::ClientMessage::Cancel { .. } => {}
+        }
+    }
+
+    fn fd_count(&self) -> usize {
+        match self {
+            crate::ClientMessage::Request(req) => req.fd_count(),
+            crate::ClientMessage::Cancel { .. } => 0,
+        }
+    }
+}
+
+impl<T: ContainsFds> ContainsFds for crate::Request<T> {
+    fn extract_fds_with_index(&self, next_index: &mut u32) -> Vec<OwnedFd> {
+        // context::Context doesn't contain FDs, only the message does
+        self.message.extract_fds_with_index(next_index)
+    }
+
+    fn inject_fds_from(&self, fds: &mut [Option<OwnedFd>]) {
+        self.message.inject_fds_from(fds)
+    }
+
+    fn fd_count(&self) -> usize {
+        self.message.fd_count()
+    }
+}
+
+impl<T: ContainsFds> ContainsFds for crate::Response<T> {
+    fn extract_fds_with_index(&self, next_index: &mut u32) -> Vec<OwnedFd> {
+        match &self.message {
+            Ok(msg) => msg.extract_fds_with_index(next_index),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn inject_fds_from(&self, fds: &mut [Option<OwnedFd>]) {
+        match &self.message {
+            Ok(msg) => msg.inject_fds_from(fds),
+            Err(_) => {}
+        }
+    }
+
+    fn fd_count(&self) -> usize {
+        match &self.message {
+            Ok(msg) => msg.fd_count(),
+            Err(_) => 0,
+        }
+    }
+}
+
+// ServerError doesn't contain FDs
+impl NoFds for crate::ServerError {}
+
+// context::Context doesn't contain FDs
+impl NoFds for crate::context::Context {}
+
+// trace::Context doesn't contain FDs
+impl NoFds for crate::trace::Context {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
