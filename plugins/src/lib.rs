@@ -907,10 +907,10 @@ fn snake_to_camel_capital_in_middle() {
 ///         fds
 ///     }
 ///
-///     fn inject_fds(&self, fds: Vec<OwnedFd>) {
-///         self.name.inject_fds(fds.clone());
-///         self.buffer.inject_fds(fds.clone());
-///         self.metadata.inject_fds(fds);
+///     fn inject_fds_from(&self, fds: &mut [Option<OwnedFd>]) {
+///         self.name.inject_fds_from(fds);
+///         self.buffer.inject_fds_from(fds);
+///         self.metadata.inject_fds_from(fds);
 ///     }
 ///
 ///     fn fd_count(&self) -> usize {
@@ -960,11 +960,11 @@ fn generate_struct_impl(
                 // Empty struct - no FDs
                 quote! {
                     impl #impl_generics ::tarpc::fd::ContainsFds for #name #ty_generics #where_clause {
-                        fn extract_fds(&self) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
+                        fn extract_fds_with_index(&self, _next_index: &mut u32) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
                             ::std::vec::Vec::new()
                         }
 
-                        fn inject_fds(&self, _fds: ::std::vec::Vec<::std::os::unix::io::OwnedFd>) {
+                        fn inject_fds_from(&self, _fds: &mut [::std::option::Option<::std::os::unix::io::OwnedFd>]) {
                         }
 
                         fn fd_count(&self) -> usize {
@@ -976,17 +976,14 @@ fn generate_struct_impl(
                 // Generate extraction: collect FDs from all fields in order, assigning sequential indices
                 let extract_fields = field_names.iter().map(|name| {
                     quote! {
-                        {
-                            let field_fds = ::tarpc::fd::ContainsFds::extract_fds(&self.#name);
-                            fds.extend(field_fds);
-                        }
+                        fds.extend(::tarpc::fd::ContainsFds::extract_fds_with_index(&self.#name, next_index));
                     }
                 });
 
                 // Generate injection: pass fds to each field
                 let inject_fields = field_names.iter().map(|name| {
                     quote! {
-                        ::tarpc::fd::ContainsFds::inject_fds(&self.#name, fds.clone());
+                        ::tarpc::fd::ContainsFds::inject_fds_from(&self.#name, fds);
                     }
                 });
 
@@ -999,13 +996,13 @@ fn generate_struct_impl(
 
                 quote! {
                     impl #impl_generics ::tarpc::fd::ContainsFds for #name #ty_generics #where_clause {
-                        fn extract_fds(&self) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
+                        fn extract_fds_with_index(&self, next_index: &mut u32) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
                             let mut fds = ::std::vec::Vec::new();
                             #(#extract_fields)*
                             fds
                         }
 
-                        fn inject_fds(&self, fds: ::std::vec::Vec<::std::os::unix::io::OwnedFd>) {
+                        fn inject_fds_from(&self, fds: &mut [::std::option::Option<::std::os::unix::io::OwnedFd>]) {
                             #(#inject_fields)*
                         }
 
@@ -1025,11 +1022,11 @@ fn generate_struct_impl(
                 // Empty tuple struct
                 quote! {
                     impl #impl_generics ::tarpc::fd::ContainsFds for #name #ty_generics #where_clause {
-                        fn extract_fds(&self) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
+                        fn extract_fds_with_index(&self, _next_index: &mut u32) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
                             ::std::vec::Vec::new()
                         }
 
-                        fn inject_fds(&self, _fds: ::std::vec::Vec<::std::os::unix::io::OwnedFd>) {
+                        fn inject_fds_from(&self, _fds: &mut [::std::option::Option<::std::os::unix::io::OwnedFd>]) {
                         }
 
                         fn fd_count(&self) -> usize {
@@ -1040,16 +1037,13 @@ fn generate_struct_impl(
             } else {
                 let extract_fields = field_indices.iter().map(|idx| {
                     quote! {
-                        {
-                            let field_fds = ::tarpc::fd::ContainsFds::extract_fds(&self.#idx);
-                            fds.extend(field_fds);
-                        }
+                        fds.extend(::tarpc::fd::ContainsFds::extract_fds_with_index(&self.#idx, next_index));
                     }
                 });
 
                 let inject_fields = field_indices.iter().map(|idx| {
                     quote! {
-                        ::tarpc::fd::ContainsFds::inject_fds(&self.#idx, fds.clone());
+                        ::tarpc::fd::ContainsFds::inject_fds_from(&self.#idx, fds);
                     }
                 });
 
@@ -1061,13 +1055,13 @@ fn generate_struct_impl(
 
                 quote! {
                     impl #impl_generics ::tarpc::fd::ContainsFds for #name #ty_generics #where_clause {
-                        fn extract_fds(&self) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
+                        fn extract_fds_with_index(&self, next_index: &mut u32) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
                             let mut fds = ::std::vec::Vec::new();
                             #(#extract_fields)*
                             fds
                         }
 
-                        fn inject_fds(&self, fds: ::std::vec::Vec<::std::os::unix::io::OwnedFd>) {
+                        fn inject_fds_from(&self, fds: &mut [::std::option::Option<::std::os::unix::io::OwnedFd>]) {
                             #(#inject_fields)*
                         }
 
@@ -1082,11 +1076,11 @@ fn generate_struct_impl(
             // Unit struct - no FDs
             quote! {
                 impl #impl_generics ::tarpc::fd::ContainsFds for #name #ty_generics #where_clause {
-                    fn extract_fds(&self) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
+                    fn extract_fds_with_index(&self, _next_index: &mut u32) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
                         ::std::vec::Vec::new()
                     }
 
-                    fn inject_fds(&self, _fds: ::std::vec::Vec<::std::os::unix::io::OwnedFd>) {
+                    fn inject_fds_from(&self, _fds: &mut [::std::option::Option<::std::os::unix::io::OwnedFd>]) {
                     }
 
                     fn fd_count(&self) -> usize {
@@ -1119,7 +1113,7 @@ fn generate_enum_impl(
                         .collect();
                     let extract_fields = field_names.iter().map(|fname| {
                         quote! {
-                            fds.extend(::tarpc::fd::ContainsFds::extract_fds(#fname));
+                            fds.extend(::tarpc::fd::ContainsFds::extract_fds_with_index(#fname, next_index));
                         }
                     });
                     quote! {
@@ -1134,7 +1128,7 @@ fn generate_enum_impl(
                         .collect();
                     let extract_fields = field_names.iter().map(|fname| {
                         quote! {
-                            fds.extend(::tarpc::fd::ContainsFds::extract_fds(#fname));
+                            fds.extend(::tarpc::fd::ContainsFds::extract_fds_with_index(#fname, next_index));
                         }
                     });
                     quote! {
@@ -1166,7 +1160,7 @@ fn generate_enum_impl(
                         .collect();
                     let inject_fields = field_names.iter().map(|fname| {
                         quote! {
-                            ::tarpc::fd::ContainsFds::inject_fds(#fname, fds.clone());
+                            ::tarpc::fd::ContainsFds::inject_fds_from(#fname, fds);
                         }
                     });
                     quote! {
@@ -1181,7 +1175,7 @@ fn generate_enum_impl(
                         .collect();
                     let inject_fields = field_names.iter().map(|fname| {
                         quote! {
-                            ::tarpc::fd::ContainsFds::inject_fds(#fname, fds.clone());
+                            ::tarpc::fd::ContainsFds::inject_fds_from(#fname, fds);
                         }
                     });
                     quote! {
@@ -1248,7 +1242,7 @@ fn generate_enum_impl(
 
     quote! {
         impl #impl_generics ::tarpc::fd::ContainsFds for #name #ty_generics #where_clause {
-            fn extract_fds(&self) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
+            fn extract_fds_with_index(&self, next_index: &mut u32) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
                 let mut fds = ::std::vec::Vec::new();
                 match self {
                     #(#extract_arms)*
@@ -1256,7 +1250,7 @@ fn generate_enum_impl(
                 fds
             }
 
-            fn inject_fds(&self, fds: ::std::vec::Vec<::std::os::unix::io::OwnedFd>) {
+            fn inject_fds_from(&self, fds: &mut [::std::option::Option<::std::os::unix::io::OwnedFd>]) {
                 match self {
                     #(#inject_arms)*
                 }

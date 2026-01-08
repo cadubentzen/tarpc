@@ -598,7 +598,7 @@ pub mod unix_fd {
 
     impl<Item, SinkItem, Codec> FdTransport<Item, SinkItem, Codec> {
         /// Creates a new FD-passing transport.
-        fn new(stream: FdUnixStream, codec: Codec) -> Self {
+        pub fn new(stream: FdUnixStream, codec: Codec) -> Self {
             Self {
                 stream,
                 codec,

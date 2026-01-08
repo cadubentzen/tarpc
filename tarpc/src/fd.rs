@@ -359,13 +359,31 @@ pub trait ContainsFds {
     /// serialization.
     ///
     /// Returns the FDs in the order they should be passed via `SCM_RIGHTS`.
-    fn extract_fds(&self) -> Vec<OwnedFd>;
+    fn extract_fds(&self) -> Vec<OwnedFd> {
+        let mut next_index = 0u32;
+        self.extract_fds_with_index(&mut next_index)
+    }
+
+    /// Extracts FDs starting from the given index.
+    ///
+    /// This method is used internally to assign sequential indices across
+    /// multiple fields. The `next_index` is updated to the next available index.
+    fn extract_fds_with_index(&self, next_index: &mut u32) -> Vec<OwnedFd>;
 
     /// Injects file descriptors into this value after deserialization.
     ///
     /// The FDs should be in the same order as they were extracted.
     /// Each `PassedFd` uses its stored index to find the correct FD.
-    fn inject_fds(&self, fds: Vec<OwnedFd>);
+    fn inject_fds(&self, fds: Vec<OwnedFd>) {
+        let mut fds: Vec<Option<OwnedFd>> = fds.into_iter().map(Some).collect();
+        self.inject_fds_from(&mut fds);
+    }
+
+    /// Injects file descriptors from a mutable slice of options.
+    ///
+    /// This method is called by `inject_fds` after converting the vector.
+    /// Each `PassedFd` takes its FD from the slot at its stored index.
+    fn inject_fds_from(&self, fds: &mut [Option<OwnedFd>]);
 
     /// Returns the number of file descriptors in this value.
     fn fd_count(&self) -> usize;
@@ -376,11 +394,11 @@ impl<T> ContainsFds for T
 where
     T: NoFds,
 {
-    fn extract_fds(&self) -> Vec<OwnedFd> {
+    fn extract_fds_with_index(&self, _next_index: &mut u32) -> Vec<OwnedFd> {
         Vec::new()
     }
 
-    fn inject_fds(&self, _fds: Vec<OwnedFd>) {
+    fn inject_fds_from(&self, _fds: &mut [Option<OwnedFd>]) {
         // No FDs to inject
     }
 
@@ -440,8 +458,9 @@ impl<T: NoFds> NoFds for [T] {}
 
 // Implement ContainsFds for PassedFd itself
 impl ContainsFds for PassedFd {
-    fn extract_fds(&self) -> Vec<OwnedFd> {
-        self.set_index(0);
+    fn extract_fds_with_index(&self, next_index: &mut u32) -> Vec<OwnedFd> {
+        self.set_index(*next_index);
+        *next_index += 1;
         if let Some(fd) = self.take_fd() {
             vec![fd]
         } else {
@@ -449,22 +468,15 @@ impl ContainsFds for PassedFd {
         }
     }
 
-    fn inject_fds(&self, fds: Vec<OwnedFd>) {
+    fn inject_fds_from(&self, fds: &mut [Option<OwnedFd>]) {
         if let Some(idx) = self.index() {
             let idx = idx as usize;
             if idx < fds.len() {
-                // Convert Vec to allow extracting a single element by index.
-                // We need to use into_iter to take ownership of the FD at our index.
-                for (i, fd) in fds.into_iter().enumerate() {
-                    if i == idx {
-                        self.inject_fd(fd);
-                        return;
-                    }
-                    // Other FDs are dropped
+                if let Some(fd) = fds[idx].take() {
+                    self.inject_fd(fd);
                 }
             }
         }
-        // If we didn't find our index, all FDs are dropped
     }
 
     fn fd_count(&self) -> usize {
@@ -474,10 +486,11 @@ impl ContainsFds for PassedFd {
 
 // Implement ContainsFds for Vec<PassedFd>
 impl ContainsFds for Vec<PassedFd> {
-    fn extract_fds(&self) -> Vec<OwnedFd> {
+    fn extract_fds_with_index(&self, next_index: &mut u32) -> Vec<OwnedFd> {
         let mut fds = Vec::with_capacity(self.len());
-        for (i, pfd) in self.iter().enumerate() {
-            pfd.set_index(i as u32);
+        for pfd in self {
+            pfd.set_index(*next_index);
+            *next_index += 1;
             if let Some(fd) = pfd.take_fd() {
                 fds.push(fd);
             }
@@ -485,10 +498,7 @@ impl ContainsFds for Vec<PassedFd> {
         fds
     }
 
-    fn inject_fds(&self, fds: Vec<OwnedFd>) {
-        // Convert to a vec of options so we can take FDs by index
-        let mut fds: Vec<Option<OwnedFd>> = fds.into_iter().map(Some).collect();
-
+    fn inject_fds_from(&self, fds: &mut [Option<OwnedFd>]) {
         for pfd in self {
             if let Some(idx) = pfd.index() {
                 let idx = idx as usize;
@@ -499,7 +509,6 @@ impl ContainsFds for Vec<PassedFd> {
                 }
             }
         }
-        // Remaining FDs in fds are dropped
     }
 
     fn fd_count(&self) -> usize {
