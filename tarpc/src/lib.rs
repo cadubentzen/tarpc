@@ -212,10 +212,30 @@ pub use {tokio_serde, tokio_util};
 #[cfg_attr(docsrs, doc(cfg(feature = "serde-transport")))]
 pub mod serde_transport;
 
+#[cfg(all(unix, feature = "fd-passing"))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "fd-passing"))))]
+pub mod fd;
+
+#[cfg(all(unix, feature = "fd-passing"))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "fd-passing"))))]
+pub mod fd_transport;
+
+#[cfg(all(unix, feature = "fd-passing"))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "fd-passing"))))]
+pub(crate) mod fd_codec;
+
 pub mod trace;
 
 #[cfg(feature = "serde1")]
 pub use tarpc_plugins::derive_serde;
+
+/// Derive macro for `ContainsFds` trait.
+///
+/// This macro generates implementations of `ContainsFds` for structs and enums
+/// that contain `PassedFd` fields or other types that implement `ContainsFds`.
+#[cfg(all(unix, feature = "fd-passing"))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "fd-passing"))))]
+pub use tarpc_plugins::ContainsFds;
 
 /// The main macro that creates RPC services.
 ///

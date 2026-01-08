@@ -554,6 +554,303 @@ pub mod unix {
     }
 }
 
+#[cfg(all(unix, feature = "unix", feature = "fd-passing"))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "unix", feature = "fd-passing"))))]
+/// Unix Domain Socket transport with file descriptor passing support.
+///
+/// This module provides a transport that can pass file descriptors between
+/// processes using `SCM_RIGHTS` control messages over Unix domain sockets.
+///
+/// # Example
+///
+/// ```ignore
+/// use tarpc::serde_transport::unix_fd;
+/// use tarpc::fd::PassedFd;
+/// use tokio_serde::formats::Bincode;
+///
+/// // Server
+/// let listener = unix_fd::listen("/tmp/my.sock", Bincode::default)?;
+/// // Use listener.accept() to get connections
+///
+/// // Client
+/// let transport = unix_fd::connect("/tmp/my.sock", Bincode::default).await?;
+/// ```
+pub mod unix_fd {
+    use {
+        super::*,
+        crate::fd::{ContainsFds, SupportsFdPassing},
+        crate::fd_transport::{FdUnixStream, FdUnixListener},
+        std::{
+            marker::PhantomData,
+            path::Path,
+        },
+    };
+
+    /// A transport that supports file descriptor passing over Unix domain sockets.
+    ///
+    /// This transport wraps an [`FdUnixStream`] and provides async methods for
+    /// sending and receiving messages with file descriptors.
+    pub struct FdTransport<Item, SinkItem, Codec> {
+        stream: FdUnixStream,
+        codec: Codec,
+        ghost: PhantomData<(fn() -> Item, fn(SinkItem))>,
+    }
+
+    impl<Item, SinkItem, Codec> FdTransport<Item, SinkItem, Codec> {
+        /// Creates a new FD-passing transport.
+        fn new(stream: FdUnixStream, codec: Codec) -> Self {
+            Self {
+                stream,
+                codec,
+                ghost: PhantomData,
+            }
+        }
+
+        /// Returns a reference to the underlying stream.
+        pub fn get_ref(&self) -> &FdUnixStream {
+            &self.stream
+        }
+
+        /// Returns a mutable reference to the underlying stream.
+        pub fn get_mut(&mut self) -> &mut FdUnixStream {
+            &mut self.stream
+        }
+    }
+
+    impl<Item, SinkItem, Codec> SupportsFdPassing for FdTransport<Item, SinkItem, Codec> {}
+
+    impl<Item, SinkItem, Codec> FdTransport<Item, SinkItem, Codec>
+    where
+        Item: for<'de> Deserialize<'de> + ContainsFds,
+        SinkItem: Serialize + ContainsFds,
+        Codec: Serializer<SinkItem> + Deserializer<Item> + Unpin,
+    {
+        /// Receives a message with any associated file descriptors.
+        ///
+        /// This method reads a framed message from the transport and injects
+        /// any received file descriptors into the deserialized message.
+        pub async fn recv(&mut self) -> io::Result<Option<Item>>
+        where
+            Codec: tokio_serde::Deserializer<Item>,
+            <Codec as tokio_serde::Deserializer<Item>>::Error: std::fmt::Debug,
+        {
+            use bytes::BytesMut;
+            use crate::fd::MAX_FDS_PER_MESSAGE;
+            use crate::fd_codec::{HEADER_SIZE, MAX_FRAME_SIZE};
+
+            // Read header
+            let mut header_buf = [0u8; 8];
+            let msg = self.stream.recv_with_fds(&mut header_buf).await?;
+            if msg.data.is_empty() {
+                return Ok(None);
+            }
+            if msg.data.len() < HEADER_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete header",
+                ));
+            }
+
+            let frame_length = u32::from_be_bytes([
+                msg.data[0], msg.data[1], msg.data[2], msg.data[3],
+            ]) as usize;
+            let fd_count = u32::from_be_bytes([
+                msg.data[4], msg.data[5], msg.data[6], msg.data[7],
+            ]) as usize;
+
+            if frame_length > MAX_FRAME_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("frame too large: {}", frame_length),
+                ));
+            }
+
+            if fd_count > MAX_FDS_PER_MESSAGE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("too many FDs: {}", fd_count),
+                ));
+            }
+
+            // Collect FDs from header read
+            let mut fds = msg.fds;
+
+            // Read body
+            let mut body_buf = vec![0u8; frame_length];
+            let mut total_read = msg.data.len() - HEADER_SIZE;
+
+            // Copy any extra data from header read
+            if total_read > 0 {
+                let extra = &msg.data[HEADER_SIZE..];
+                body_buf[..extra.len()].copy_from_slice(extra);
+            }
+
+            // Read remaining body
+            while total_read < frame_length || fds.len() < fd_count {
+                let body_msg = self.stream.recv_with_fds(&mut body_buf[total_read..]).await?;
+                if body_msg.data.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "unexpected EOF while reading frame body",
+                    ));
+                }
+                total_read += body_msg.data.len();
+                fds.extend(body_msg.fds);
+            }
+
+            // Deserialize using tokio_serde::Deserializer trait
+            let frame_bytes = BytesMut::from(&body_buf[..]);
+            let message: Item = Deserializer::deserialize(Pin::new(&mut self.codec), &frame_bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{:?}", e)))?;
+
+            // Inject FDs
+            let fd_vec: Vec<_> = fds.into_iter().take(fd_count).collect();
+            message.inject_fds(fd_vec);
+
+            Ok(Some(message))
+        }
+
+        /// Sends a message with any associated file descriptors.
+        ///
+        /// This method extracts file descriptors from the message, serializes it,
+        /// and sends both the data and FDs over the transport.
+        pub async fn send(&mut self, item: SinkItem) -> io::Result<()>
+        where
+            Codec: tokio_serde::Serializer<SinkItem>,
+            <Codec as tokio_serde::Serializer<SinkItem>>::Error: std::fmt::Debug,
+        {
+            use bytes::BufMut;
+            use std::os::unix::io::{AsRawFd, BorrowedFd};
+            use crate::fd::MAX_FDS_PER_MESSAGE;
+
+            // Extract FDs before serialization
+            let fds = item.extract_fds();
+            let fd_count = fds.len();
+
+            if fd_count > MAX_FDS_PER_MESSAGE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("too many FDs: {}", fd_count),
+                ));
+            }
+
+            // Serialize using tokio_serde::Serializer trait
+            let encoded = Serializer::serialize(Pin::new(&mut self.codec), &item)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{:?}", e)))?;
+
+            // Build frame
+            let mut frame = Vec::with_capacity(8 + encoded.len());
+            frame.put_u32(encoded.len() as u32);
+            frame.put_u32(fd_count as u32);
+            frame.extend_from_slice(&encoded);
+
+            // Borrow FDs
+            let borrowed_fds: Vec<BorrowedFd<'_>> = fds.iter()
+                .map(|fd| unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) })
+                .collect();
+
+            // Send
+            self.stream.send_all_with_fds(&frame, &borrowed_fds).await?;
+
+            Ok(())
+        }
+    }
+
+    /// Connects to a Unix socket with FD-passing support.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use tarpc::serde_transport::unix_fd;
+    /// use tokio_serde::formats::Bincode;
+    ///
+    /// let mut transport = unix_fd::connect("/tmp/my.sock", Bincode::default).await?;
+    /// transport.send(my_message).await?;
+    /// let response = transport.recv().await?;
+    /// ```
+    pub async fn connect<P, Item, SinkItem, Codec, CodecFn>(
+        path: P,
+        codec_fn: CodecFn,
+    ) -> io::Result<FdTransport<Item, SinkItem, Codec>>
+    where
+        P: AsRef<Path>,
+        Item: for<'de> Deserialize<'de>,
+        SinkItem: Serialize,
+        Codec: Serializer<SinkItem> + Deserializer<Item>,
+        CodecFn: FnOnce() -> Codec,
+    {
+        let stream = FdUnixStream::connect(path).await?;
+        Ok(FdTransport::new(stream, codec_fn()))
+    }
+
+    /// A listener that accepts FD-passing connections.
+    pub struct Incoming<Item, SinkItem, Codec, CodecFn> {
+        listener: FdUnixListener,
+        local_addr: std::os::unix::net::SocketAddr,
+        codec_fn: CodecFn,
+        ghost: PhantomData<(fn() -> Item, fn(SinkItem), Codec)>,
+    }
+
+    /// Listens on a Unix socket with FD-passing support.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use tarpc::serde_transport::unix_fd;
+    /// use tokio_serde::formats::Bincode;
+    ///
+    /// let listener = unix_fd::listen("/tmp/my.sock", Bincode::default)?;
+    /// loop {
+    ///     let mut transport = listener.accept().await?;
+    ///     // Handle connection
+    /// }
+    /// ```
+    pub fn listen<P, Item, SinkItem, Codec, CodecFn>(
+        path: P,
+        codec_fn: CodecFn,
+    ) -> io::Result<Incoming<Item, SinkItem, Codec, CodecFn>>
+    where
+        P: AsRef<Path>,
+        Item: for<'de> Deserialize<'de>,
+        SinkItem: Serialize,
+        Codec: Serializer<SinkItem> + Deserializer<Item>,
+        CodecFn: Fn() -> Codec,
+    {
+        let listener = FdUnixListener::bind(path)?;
+        let local_addr = listener.local_addr()?;
+        Ok(Incoming {
+            listener,
+            codec_fn,
+            local_addr,
+            ghost: PhantomData,
+        })
+    }
+
+    impl<Item, SinkItem, Codec, CodecFn> Incoming<Item, SinkItem, Codec, CodecFn> {
+        /// Returns the local address this listener is bound to.
+        pub fn local_addr(&self) -> &std::os::unix::net::SocketAddr {
+            &self.local_addr
+        }
+
+        /// Accepts a new connection.
+        pub async fn accept(&self) -> io::Result<FdTransport<Item, SinkItem, Codec>>
+        where
+            CodecFn: Fn() -> Codec,
+        {
+            let stream = self.listener.accept().await?;
+            Ok(FdTransport::new(stream, (self.codec_fn)()))
+        }
+    }
+
+    impl<Item, SinkItem, Codec, CodecFn> SupportsFdPassing
+        for Incoming<Item, SinkItem, Codec, CodecFn>
+    {
+    }
+
+    /// Re-export TempPathBuf for convenience
+    pub use super::unix::TempPathBuf;
+}
+
 #[cfg(test)]
 mod tests {
     use super::Transport;

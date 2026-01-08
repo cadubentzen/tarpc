@@ -27,6 +27,9 @@ serde-transport-bincode = ["serde-transport", "tokio-serde/bincode"]
 tcp = ["tokio/net"]
 unix = ["tokio/net"]
 
+# File descriptor passing over Unix domain sockets (Linux only)
+fd-passing = ["unix", "serde-transport", "libc", "bytes"]
+
 full = [
     "serde1",
     "tokio1",
@@ -35,6 +38,7 @@ full = [
     "serde-transport-bincode",
     "tcp",
     "unix",
+    "fd-passing",
 ]
 
 [badges]
@@ -42,9 +46,11 @@ travis-ci = { repository = "google/tarpc" }
 
 [dependencies]
 anyhow = "1.0"
+bytes = { optional = true, version = "1.0" }
 fnv = "1.0"
 futures = "0.3"
 humantime = "2.3"
+libc = { optional = true, version = "0.2" }
 pin-project = "1.1"
 rand = "0.9"
 serde = { optional = true, version = "1.0", features = ["derive"] }
@@ -73,6 +79,8 @@ opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 pin-utils = "0.1"
 serde_bytes = "0.11"
+serde_json = "1.0"
+tempfile = "3.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full", "test-util", "tracing"] }
 console-subscriber = "0.5"

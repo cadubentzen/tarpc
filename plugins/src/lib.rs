@@ -15,8 +15,8 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{ToTokens, format_ident, quote};
 use syn::{
-    AttrStyle, Attribute, Expr, FnArg, Ident, Lit, LitBool, MetaNameValue, Pat, PatType, Path,
-    ReturnType, Token, Type, Visibility, braced,
+    AttrStyle, Attribute, Data, DeriveInput, Expr, Fields, FnArg, Ident, Lit, LitBool,
+    MetaNameValue, Pat, PatType, Path, ReturnType, Token, Type, Visibility, braced,
     ext::IdentExt,
     parenthesized,
     parse::{Parse, ParseStream},
@@ -865,4 +865,408 @@ fn snake_to_camel_underscore_consecutive() {
 #[test]
 fn snake_to_camel_capital_in_middle() {
     assert_eq!(snake_to_camel("aBc_dEf"), "AbcDef");
+}
+
+/// Derive macro for `ContainsFds` trait.
+///
+/// This macro generates implementations of `ContainsFds` for structs that contain
+/// `PassedFd` fields or other types that implement `ContainsFds`.
+///
+/// # Example
+///
+/// ```ignore
+/// use tarpc::fd::{PassedFd, ContainsFds};
+///
+/// #[derive(ContainsFds)]
+/// struct MyRequest {
+///     name: String,
+///     buffer: PassedFd,
+///     metadata: NestedStruct,
+/// }
+///
+/// #[derive(ContainsFds)]
+/// struct NestedStruct {
+///     id: u32,
+///     extra_fd: PassedFd,
+/// }
+/// ```
+///
+/// # Generated Code
+///
+/// For the above example, the macro generates:
+///
+/// ```ignore
+/// impl ContainsFds for MyRequest {
+///     fn extract_fds(&self) -> Vec<OwnedFd> {
+///         let mut fds = Vec::new();
+///         let mut index = 0u32;
+///         // For each field, delegate to its ContainsFds impl
+///         fds.extend(self.name.extract_fds());
+///         fds.extend(self.buffer.extract_fds());
+///         fds.extend(self.metadata.extract_fds());
+///         fds
+///     }
+///
+///     fn inject_fds(&self, fds: Vec<OwnedFd>) {
+///         self.name.inject_fds(fds.clone());
+///         self.buffer.inject_fds(fds.clone());
+///         self.metadata.inject_fds(fds);
+///     }
+///
+///     fn fd_count(&self) -> usize {
+///         self.name.fd_count() + self.buffer.fd_count() + self.metadata.fd_count()
+///     }
+/// }
+/// ```
+#[proc_macro_derive(ContainsFds)]
+pub fn derive_contains_fds(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+    let generics = &input.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    let expanded = match &input.data {
+        Data::Struct(data_struct) => {
+            generate_struct_impl(name, &impl_generics, &ty_generics, where_clause, &data_struct.fields)
+        }
+        Data::Enum(data_enum) => {
+            generate_enum_impl(name, &impl_generics, &ty_generics, where_clause, data_enum)
+        }
+        Data::Union(_) => {
+            syn::Error::new_spanned(&input, "ContainsFds cannot be derived for unions")
+                .to_compile_error()
+        }
+    };
+
+    TokenStream::from(expanded)
+}
+
+fn generate_struct_impl(
+    name: &Ident,
+    impl_generics: &syn::ImplGenerics,
+    ty_generics: &syn::TypeGenerics,
+    where_clause: Option<&syn::WhereClause>,
+    fields: &Fields,
+) -> TokenStream2 {
+    match fields {
+        Fields::Named(named) => {
+            let field_names: Vec<_> = named
+                .named
+                .iter()
+                .map(|f| f.ident.as_ref().unwrap())
+                .collect();
+
+            if field_names.is_empty() {
+                // Empty struct - no FDs
+                quote! {
+                    impl #impl_generics ::tarpc::fd::ContainsFds for #name #ty_generics #where_clause {
+                        fn extract_fds(&self) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
+                            ::std::vec::Vec::new()
+                        }
+
+                        fn inject_fds(&self, _fds: ::std::vec::Vec<::std::os::unix::io::OwnedFd>) {
+                        }
+
+                        fn fd_count(&self) -> usize {
+                            0
+                        }
+                    }
+                }
+            } else {
+                // Generate extraction: collect FDs from all fields in order, assigning sequential indices
+                let extract_fields = field_names.iter().map(|name| {
+                    quote! {
+                        {
+                            let field_fds = ::tarpc::fd::ContainsFds::extract_fds(&self.#name);
+                            fds.extend(field_fds);
+                        }
+                    }
+                });
+
+                // Generate injection: pass fds to each field
+                let inject_fields = field_names.iter().map(|name| {
+                    quote! {
+                        ::tarpc::fd::ContainsFds::inject_fds(&self.#name, fds.clone());
+                    }
+                });
+
+                // Generate fd_count: sum of all field counts
+                let count_fields = field_names.iter().map(|name| {
+                    quote! {
+                        ::tarpc::fd::ContainsFds::fd_count(&self.#name)
+                    }
+                });
+
+                quote! {
+                    impl #impl_generics ::tarpc::fd::ContainsFds for #name #ty_generics #where_clause {
+                        fn extract_fds(&self) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
+                            let mut fds = ::std::vec::Vec::new();
+                            #(#extract_fields)*
+                            fds
+                        }
+
+                        fn inject_fds(&self, fds: ::std::vec::Vec<::std::os::unix::io::OwnedFd>) {
+                            #(#inject_fields)*
+                        }
+
+                        fn fd_count(&self) -> usize {
+                            0 #(+ #count_fields)*
+                        }
+                    }
+                }
+            }
+        }
+        Fields::Unnamed(unnamed) => {
+            let field_indices: Vec<_> = (0..unnamed.unnamed.len())
+                .map(syn::Index::from)
+                .collect();
+
+            if field_indices.is_empty() {
+                // Empty tuple struct
+                quote! {
+                    impl #impl_generics ::tarpc::fd::ContainsFds for #name #ty_generics #where_clause {
+                        fn extract_fds(&self) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
+                            ::std::vec::Vec::new()
+                        }
+
+                        fn inject_fds(&self, _fds: ::std::vec::Vec<::std::os::unix::io::OwnedFd>) {
+                        }
+
+                        fn fd_count(&self) -> usize {
+                            0
+                        }
+                    }
+                }
+            } else {
+                let extract_fields = field_indices.iter().map(|idx| {
+                    quote! {
+                        {
+                            let field_fds = ::tarpc::fd::ContainsFds::extract_fds(&self.#idx);
+                            fds.extend(field_fds);
+                        }
+                    }
+                });
+
+                let inject_fields = field_indices.iter().map(|idx| {
+                    quote! {
+                        ::tarpc::fd::ContainsFds::inject_fds(&self.#idx, fds.clone());
+                    }
+                });
+
+                let count_fields = field_indices.iter().map(|idx| {
+                    quote! {
+                        ::tarpc::fd::ContainsFds::fd_count(&self.#idx)
+                    }
+                });
+
+                quote! {
+                    impl #impl_generics ::tarpc::fd::ContainsFds for #name #ty_generics #where_clause {
+                        fn extract_fds(&self) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
+                            let mut fds = ::std::vec::Vec::new();
+                            #(#extract_fields)*
+                            fds
+                        }
+
+                        fn inject_fds(&self, fds: ::std::vec::Vec<::std::os::unix::io::OwnedFd>) {
+                            #(#inject_fields)*
+                        }
+
+                        fn fd_count(&self) -> usize {
+                            0 #(+ #count_fields)*
+                        }
+                    }
+                }
+            }
+        }
+        Fields::Unit => {
+            // Unit struct - no FDs
+            quote! {
+                impl #impl_generics ::tarpc::fd::ContainsFds for #name #ty_generics #where_clause {
+                    fn extract_fds(&self) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
+                        ::std::vec::Vec::new()
+                    }
+
+                    fn inject_fds(&self, _fds: ::std::vec::Vec<::std::os::unix::io::OwnedFd>) {
+                    }
+
+                    fn fd_count(&self) -> usize {
+                        0
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn generate_enum_impl(
+    name: &Ident,
+    impl_generics: &syn::ImplGenerics,
+    ty_generics: &syn::TypeGenerics,
+    where_clause: Option<&syn::WhereClause>,
+    data_enum: &syn::DataEnum,
+) -> TokenStream2 {
+    let extract_arms: Vec<_> = data_enum
+        .variants
+        .iter()
+        .map(|variant| {
+            let variant_name = &variant.ident;
+            match &variant.fields {
+                Fields::Named(named) => {
+                    let field_names: Vec<_> = named
+                        .named
+                        .iter()
+                        .map(|f| f.ident.as_ref().unwrap())
+                        .collect();
+                    let extract_fields = field_names.iter().map(|fname| {
+                        quote! {
+                            fds.extend(::tarpc::fd::ContainsFds::extract_fds(#fname));
+                        }
+                    });
+                    quote! {
+                        #name::#variant_name { #(#field_names),* } => {
+                            #(#extract_fields)*
+                        }
+                    }
+                }
+                Fields::Unnamed(unnamed) => {
+                    let field_names: Vec<_> = (0..unnamed.unnamed.len())
+                        .map(|i| format_ident!("__field_{}", i))
+                        .collect();
+                    let extract_fields = field_names.iter().map(|fname| {
+                        quote! {
+                            fds.extend(::tarpc::fd::ContainsFds::extract_fds(#fname));
+                        }
+                    });
+                    quote! {
+                        #name::#variant_name(#(#field_names),*) => {
+                            #(#extract_fields)*
+                        }
+                    }
+                }
+                Fields::Unit => {
+                    quote! {
+                        #name::#variant_name => {}
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let inject_arms: Vec<_> = data_enum
+        .variants
+        .iter()
+        .map(|variant| {
+            let variant_name = &variant.ident;
+            match &variant.fields {
+                Fields::Named(named) => {
+                    let field_names: Vec<_> = named
+                        .named
+                        .iter()
+                        .map(|f| f.ident.as_ref().unwrap())
+                        .collect();
+                    let inject_fields = field_names.iter().map(|fname| {
+                        quote! {
+                            ::tarpc::fd::ContainsFds::inject_fds(#fname, fds.clone());
+                        }
+                    });
+                    quote! {
+                        #name::#variant_name { #(#field_names),* } => {
+                            #(#inject_fields)*
+                        }
+                    }
+                }
+                Fields::Unnamed(unnamed) => {
+                    let field_names: Vec<_> = (0..unnamed.unnamed.len())
+                        .map(|i| format_ident!("__field_{}", i))
+                        .collect();
+                    let inject_fields = field_names.iter().map(|fname| {
+                        quote! {
+                            ::tarpc::fd::ContainsFds::inject_fds(#fname, fds.clone());
+                        }
+                    });
+                    quote! {
+                        #name::#variant_name(#(#field_names),*) => {
+                            #(#inject_fields)*
+                        }
+                    }
+                }
+                Fields::Unit => {
+                    quote! {
+                        #name::#variant_name => {}
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let count_arms: Vec<_> = data_enum
+        .variants
+        .iter()
+        .map(|variant| {
+            let variant_name = &variant.ident;
+            match &variant.fields {
+                Fields::Named(named) => {
+                    let field_names: Vec<_> = named
+                        .named
+                        .iter()
+                        .map(|f| f.ident.as_ref().unwrap())
+                        .collect();
+                    let count_fields = field_names.iter().map(|fname| {
+                        quote! {
+                            ::tarpc::fd::ContainsFds::fd_count(#fname)
+                        }
+                    });
+                    quote! {
+                        #name::#variant_name { #(#field_names),* } => {
+                            0 #(+ #count_fields)*
+                        }
+                    }
+                }
+                Fields::Unnamed(unnamed) => {
+                    let field_names: Vec<_> = (0..unnamed.unnamed.len())
+                        .map(|i| format_ident!("__field_{}", i))
+                        .collect();
+                    let count_fields = field_names.iter().map(|fname| {
+                        quote! {
+                            ::tarpc::fd::ContainsFds::fd_count(#fname)
+                        }
+                    });
+                    quote! {
+                        #name::#variant_name(#(#field_names),*) => {
+                            0 #(+ #count_fields)*
+                        }
+                    }
+                }
+                Fields::Unit => {
+                    quote! {
+                        #name::#variant_name => 0
+                    }
+                }
+            }
+        })
+        .collect();
+
+    quote! {
+        impl #impl_generics ::tarpc::fd::ContainsFds for #name #ty_generics #where_clause {
+            fn extract_fds(&self) -> ::std::vec::Vec<::std::os::unix::io::OwnedFd> {
+                let mut fds = ::std::vec::Vec::new();
+                match self {
+                    #(#extract_arms)*
+                }
+                fds
+            }
+
+            fn inject_fds(&self, fds: ::std::vec::Vec<::std::os::unix::io::OwnedFd>) {
+                match self {
+                    #(#inject_arms)*
+                }
+            }
+
+            fn fd_count(&self) -> usize {
+                match self {
+                    #(#count_arms)*
+                }
+            }
+        }
+    }
 }
