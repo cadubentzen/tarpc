@@ -15,7 +15,7 @@
 
 use futures::prelude::*;
 use std::io::{Read, Seek, Write};
-use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use tarpc::{
     client, context,
     fd::PassedFd,
@@ -45,6 +45,12 @@ pub trait FileService {
     ///
     /// This demonstrates passing multiple FDs in a single request.
     async fn copy_file(src: PassedFd, dst: PassedFd) -> usize;
+
+    /// Reads from a memfd (memory file descriptor).
+    ///
+    /// This demonstrates zero-copy memory sharing - the client creates a memfd,
+    /// writes data to it, and the server can read directly from the same memory.
+    async fn read_memfd(fd: PassedFd) -> Vec<u8>;
 
     /// A simple method without file descriptors, for comparison.
     async fn ping() -> String;
@@ -86,15 +92,50 @@ impl FileService for FileServer {
         dst_file.write(&buf).unwrap_or(0)
     }
 
+    async fn read_memfd(self, _: context::Context, fd: PassedFd) -> Vec<u8> {
+        let owned_fd: OwnedFd = fd.into_fd();
+        let mut file = unsafe { std::fs::File::from_raw_fd(owned_fd.into_raw_fd()) };
+
+        // Seek to start and read the content
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).unwrap_or(0);
+        buf
+    }
+
     async fn ping(self, _: context::Context) -> String {
         "pong".to_string()
     }
 }
 
+/// Creates a memfd (memory file descriptor) using the memfd_create syscall.
+///
+/// This creates an anonymous file that lives in memory, which can be passed
+/// between processes via FD passing for zero-copy memory sharing.
+fn create_memfd(name: &str) -> std::io::Result<OwnedFd> {
+    use std::ffi::CString;
+
+    let name_cstr = CString::new(name).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid memfd name")
+    })?;
+
+    // MFD_CLOEXEC = 0x0001 - close on exec
+    // MFD_ALLOW_SEALING = 0x0002 - allow sealing operations
+    let flags = 0x0001u32; // MFD_CLOEXEC
+
+    let fd = unsafe { libc::memfd_create(name_cstr.as_ptr(), flags) };
+
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    use tarpc::serde_transport::unix_fd;
     use tarpc::fd_transport::FdUnixStream;
+    use tarpc::serde_transport::unix_fd;
 
     // For this example, we'll use a socketpair to avoid threading issues
     // with PassedFd's Cell-based interior mutability.
@@ -145,7 +186,11 @@ async fn main() -> anyhow::Result<()> {
         let content = client
             .read_file(context::current(), PassedFd::new(fd), 1024)
             .await?;
-        println!("Server read {} bytes: {:?}", content.len(), String::from_utf8_lossy(&content));
+        println!(
+            "Server read {} bytes: {:?}",
+            content.len(),
+            String::from_utf8_lossy(&content)
+        );
 
         println!("\n--- Test 3: Write file via FD ---");
         // Create a temp file for writing
@@ -181,11 +226,44 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         println!("Server copied {} bytes between FDs", bytes_copied);
 
+        println!("\n--- Test 5: Share memory via memfd ---");
+        // Create a memfd (anonymous memory file)
+        let memfd = create_memfd("shared_buffer")?;
+        println!("Created memfd with fd={}", memfd.as_raw_fd());
+
+        // Write data to the memfd
+        let mut memfile = unsafe { std::fs::File::from_raw_fd(memfd.into_raw_fd()) };
+        let shared_data = b"This data lives in memory and is shared via memfd! \
+                           Zero-copy sharing between processes!";
+        memfile.write_all(shared_data)?;
+        memfile.flush()?;
+        println!("Client wrote {} bytes to memfd", shared_data.len());
+
+        // Convert back to OwnedFd and pass to server
+        let memfd: OwnedFd = memfile.into();
+        let received_data = client
+            .read_memfd(context::current(), PassedFd::new(memfd))
+            .await?;
+
+        println!(
+            "Server read {} bytes from memfd: {:?}",
+            received_data.len(),
+            String::from_utf8_lossy(&received_data)
+        );
+
+        // Verify the data matches
+        if received_data == shared_data {
+            println!("✓ memfd data matches! Zero-copy sharing successful!");
+        } else {
+            println!("✗ Data mismatch!");
+        }
+
         println!("\n=== Example completed successfully! ===");
         println!("\nThis example demonstrated:");
         println!("  - Using #[tarpc::service(derive_contains_fds = true)]");
         println!("  - Passing single file descriptors (read_file, write_file)");
         println!("  - Passing multiple file descriptors (copy_file)");
+        println!("  - Sharing memory via memfd (read_memfd) - zero-copy!");
         println!("  - Integration with tarpc's high-level client/server infrastructure");
         println!("  - Using FdChannelTransport with BaseChannel and Client");
 
