@@ -80,6 +80,8 @@ tokio-serde = { version = "0.9", features = ["json", "bincode"] }
 trybuild = "1.0"
 tokio-rustls = "0.26"
 rustls-pemfile = "2.2"
+libc = "0.2"
+tempfile = "3"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -108,6 +110,10 @@ required-features = ["serde1", "tokio1", "serde-transport"]
 [[example]]
 name = "tls_over_tcp"
 required-features = ["full"]
+
+[[example]]
+name = "fd_passing_external"
+required-features = ["serde-transport", "unix"]
 
 [[test]]
 name = "service_functional"
